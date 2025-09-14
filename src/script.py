@@ -1,8 +1,10 @@
 import os
+import re, pathlib
+import time
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
 from pydantic import SecretStr
-from typing import Any
+from typing import List, Dict, Any
 from pathlib import Path
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -49,17 +51,6 @@ def interactions_with_llm(llm):
         print(resp_test.content)
         print("-" * 20)
 
-def agent_interactions(retriever, document_chain):
-    while True:
-        user_input = input("")
-        if user_input.lower() in ["exit", "quit"]:
-            break
-
-        context = retriever.invoke(user_input)
-        answer = document_chain.invoke({"input": user_input, "context": context})
-        print(answer)
-        print("-" * 100)
-
 def create_chucks_from_docs(docs) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
     return splitter.split_documents(docs)
@@ -77,12 +68,66 @@ def create_document_chain(llm):
 
 def create_retriever(chunks, embedding_llm):
     vectorstore = FAISS.from_documents(chunks, embedding_llm)
-    retriever = vectorstore.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"score_threshold": 0.3, "k": 4}
-    )
+    retriever = vectorstore.as_retriever(search_type="similarity_score_threshold", search_kwargs={"score_threshold": 0.3, "k": 4})
     return retriever
 
+def _clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def excerpt_extraction(texto: str, query: str, janela: int = 240) -> str:
+    txt = _clean_text(texto)
+    termos = [t.lower() for t in re.findall(r"\w+", query or "") if len(t) >= 4]
+    pos = -1
+    for t in termos:
+        pos = txt.lower().find(t)
+        if pos != -1: break
+    if pos == -1: pos = 0
+    ini, fim = max(0, pos - janela//2), min(len(txt), pos + janela//2)
+    return txt[ini:fim]
+
+def quote_format(docs_rel: List, query: str) -> List[Dict]:
+    cites, seen = [], set()
+    for d in docs_rel:
+        src = pathlib.Path(d.metadata.get("source","")).name
+        page = int(d.metadata.get("page", 0)) + 1
+        key = (src, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        cites.append({"document": src, "page": page, "excerpt": excerpt_extraction(d.page_content, query)})
+    return cites[:3]
+
+def agent_interactions(retriever, document_chain):
+    while True:
+
+        print("")
+        user_input = input("QUESTION: ")
+        if user_input == "":
+           continue
+
+        if user_input.lower() in ["exit", "quit"]:
+            break
+
+        start_time = time.time()
+        
+        context = retriever.invoke(user_input)
+        answer = document_chain.invoke({"input": user_input, "context": context})
+
+        txt = (answer or "").strip()
+
+        if txt.rstrip(".!?") == "I don't know":
+            answer_formated =  {"answer": "I don't know", "quote": [], "found_quote": False}
+        else:
+            answer_formated = {"answer": txt, "quote": quote_format(context, user_input), "found_quote": True}
+
+        print(f"ANSWER: {answer_formated['answer']}")
+        if answer_formated['found_quote']:
+            print("Datasource:")
+            for quote in answer_formated['quote']:
+                print(f" - Document: {quote.get('document')}, Page: {quote.get('page')}")
+                print(f"   Excerpt: {quote.get('excerpt')}")
+        end_time = time.time()
+        print(f"Execution time: {end_time - start_time:.2f} seconds")
 
 def main():
     print("Starting IA agent...")
